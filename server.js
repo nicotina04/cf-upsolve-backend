@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 8080;
 let isCFdown = false;
 
 // Initiating DB(SQLITE)
-const db = new sqlite3.Database('./cf-upsolve.db', sqlite3.OPEN_CREATE | sqlite3.OPEN_READWRITE, (error) => {
+let db = new sqlite3.Database('./cf-upsolve.db', sqlite3.OPEN_CREATE | sqlite3.OPEN_READWRITE, (error) => {
   if (error) {
     console.error(error.message);
     process.exit(1);
@@ -564,3 +564,5 @@ app.listen(PORT, () => {
   setInterval(wakeUpSnoozingProblems, 3600 * 1000);
   setInterval(cleanUpForgottenUsers, 15 * 24 * 3600 * 1000);
 });
+
+db.close();
