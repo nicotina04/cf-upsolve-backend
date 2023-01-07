@@ -1,6 +1,6 @@
 const request = require('request');
 const express = require('express');
-const sqlite3 = require('sqlite3');
+const { Deta } = require('deta');
 require('dotenv').config();
 
 const app = express();
@@ -8,20 +8,9 @@ const PORT = process.env.PORT || 8080;
 
 let isCFdown = false;
 
-// Initiating DB(SQLITE)
-let db = new sqlite3.Database('./cf-upsolve.db', sqlite3.OPEN_CREATE | sqlite3.OPEN_READWRITE, (error) => {
-  if (error) {
-    console.error(error.message);
-    process.exit(1);
-  } else {
-    console.log('db connected successfully');
-  }
-});
-
-// Create tables
-db.run('CREATE TABLE IF NOT EXISTS user(cf_handle TEXT primary key, last_access TEXT)');
-db.run('CREATE TABLE IF NOT EXISTS snoozed(cf_handle TEXT primary key, problemId TEXT, snooze_date TEXT)');
-db.run('CREATE TABLE IF NOT EXISTS skipped(cf_handle TEXT primary key, problemId TEXT)');
+// Initiating DB(Deta Base)
+const deta = Deta(process.env.DETA_BASE_KEY);
+const db = deta.Base("upsolveDB");
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -30,21 +19,10 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Credentials', true);
   next();
 });
+app.use(express.json());
 
 let problemData = {};
 let tagSlabs = [[], [], [], [], [], []]; // <1200, <1600, <1900, <2100, <2400, >2399
-
-function dbAllWait(_db, query) {
-  return new Promise((resolve, reject) => {
-    _db.all(query, (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows);
-      }
-    });
-  });
-}
 
 function checkCFdown() {
   // eslint-disable-next-line no-unused-vars
@@ -59,7 +37,7 @@ function checkCFdown() {
 
 function getCFData() {
   if (isCFdown) {
-    console.log('Codeforces server is not working. Try later...', new Date());
+    console.log('Codeforces server is not working. Retry later...', new Date());
     return;
   }
 
@@ -145,6 +123,11 @@ function processRequest(handle, counts, response, low, high) {
   const AC = new Set();
   const snoozed = new Set();
   const touched = new Set();
+  let dbEntry = {
+    key: handle,
+    skipped: [],
+    snoozed: []
+  };
 
   const getSuggestion = () => {
     const easy = [];
@@ -252,12 +235,6 @@ function processRequest(handle, counts, response, low, high) {
         return;
       }
 
-      db.all(`SELECT * FROM user WHERE cf_handle='${handle}'`, (err, rows) => {
-        if (rows === undefined || rows.length === 0) {
-          newUser = true;
-        }
-      });
-
       const user = data["result"][0];
       userRating = user["maxRating"];
 
@@ -284,13 +261,24 @@ function processRequest(handle, counts, response, low, high) {
             return;
           }
 
-          db.all(`SELECT * FROM skipped WHERE cf_handle='${handle}'`, (err, rows) => {
-            rows.forEach((item) => {
-              AC.push(item["problemId"]);
+          db.get(handle).then((entry) => {
+            if (entry === null) {
+              db.put({key: handle, skipped: [], snoozed: []}, undefined, {expireIn: 3600 * 24 * 30});
+              return;
+            }
+            dbEntry = entry;
+            let currentDate = new Date() - 0;
+
+            dbEntry.snoozed = dbEntry.snoozed.filter((item) => {
+              return currentDate - item[1] > 1000 * 3600 * 48;
             });
-          }).all(`SELECT * FROM snoozed WHERE cf_handle='${handle}'`, (err, rows) => {
-            rows.forEach((item)=> {
-              snoozed.push(item["problemId"]);
+
+            dbEntry.snoozed.forEach((item) => {
+              snoozed.add(item);
+            });
+
+            dbEntry.skipped.forEach((item) => {
+              AC.add(item);
             });
           });
 
@@ -315,13 +303,8 @@ function processRequest(handle, counts, response, low, high) {
             solvability /= AC.size;
           }
 
-          if (newUser) {
-            db.run(`INSERT INTO user VALUES('${handle}', datetime('now'))`);
-          }
-          else {
-            db.run(`UPDATE user SET last_access=datetime('now') WHERE cf_handle='${handle}'`);
-          }
-        } catch(err) {
+          db.put(dbEntry, undefined, {expireIn: 3600 * 24 * 30});
+        } catch (err) {
           console.log(err);
           response.json({errorMessage: "Some error occurred! Please try again later!"});
         } finally {
@@ -374,8 +357,17 @@ const verifySubmission = (handle, cid, index, response) => {
 
 const skipQuestion = (handle, pid, response) => {
   try {
-    db.run(`INSERT INTO skipped VALUES('${handle}', '${pid}')`);
-  } catch(err) {
+    db.get(handle).then((entry) => {
+      if (entry === null) {
+        // unknown error
+        return;
+      }
+
+      entry.skipped.push(pid);
+      db.update({skipped: entry.skipped}, handle);
+      // db.put(entry);
+    });
+  } catch (err) {
     response.json({errorMessage: "Some error occurred! Please try again later!"});
   }
 }
@@ -388,26 +380,6 @@ const getIndex = (usidx, tag) => {
     }
   })
   return index;
-}
-
-function wakeUpSnoozingProblems() {
-  db.run("DELETE FROM snoozed WHERE strftime('%s', 'now') - strftime('%s', snooze_date) > 172800", (err) => {
-    if (err) {
-      console.warn("Error occurred while wake up snoozing problems");
-    }
-  });
-}
-
-function cleanUpForgottenUsers() {
-  db.run("DELETE FROM skipped WHERE cf_handle in (SELECT cf_handle FROM user WHERE strftime('%s', 'now') - strftime('%s', last_access)) > 15 * 24 * 3600", (err) => {
-    if (err) {
-      console.error("Failed to clean skipped problems");
-    }
-  }).run("DELETE FROM user WHERE strftime('%s', 'now') - strftime('%s', last_access) > 15 * 24 * 3600", (err) => {
-    if (err) {
-      console.error("Failed to clean fogotten useres");
-    }
-  });
 }
 
 /* HTTP GET */
@@ -452,7 +424,10 @@ app.get('/later/:handle/:pid', (request, response) => {
   try {
     const snoozeHandle = request.params.handle;
     const problemId = request.params.pid;
-    db.run(`INSERT INTO snoozed VALUES('${snoozeHandle}', '${problemId}', datetime('now'))`);
+    db.get(snoozeHandle).then((entry) => {
+      entry.snoozed.push([problemId, new Date() - 0]);
+      db.update({snoozed: entry.snoozed}, snoozeHandle);
+    });
   } catch (err) {
     response.json({errorMessage: 'Some error occurred! Please try again later!'});
   }
@@ -545,9 +520,9 @@ app.get('/swot/:handle', (req, response) => {
       } catch (e) {
         response.json({ errorMessage: 'Some Error occurred! Please try again later.' });
       } finally {
-        dbAllWait(db, `SELECT * FROM user WHERE cf_handle='${handle}'`).then((result) => {
-          if (result.length === 0) {
-            db.run(`INSERT INTO user VALUES('${handle}', datetime('now'))`);
+        db.get(handle).then((result) => {
+          if (result === null) {
+            db.put({key: handle, skipped: [], snoozed: []}, undefined, {expireIn: 3600 * 24 * 30});
           }
         });
       }
@@ -561,8 +536,4 @@ app.listen(PORT, () => {
   getCFData();
   setInterval(getCFData, 3600 * 1000);
   setInterval(checkCFdown, 5 * 60 * 1000);
-  setInterval(wakeUpSnoozingProblems, 3600 * 1000);
-  setInterval(cleanUpForgottenUsers, 15 * 24 * 3600 * 1000);
 });
-
-db.close();
